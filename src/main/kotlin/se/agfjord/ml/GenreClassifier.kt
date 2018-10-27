@@ -40,7 +40,7 @@ class GenreClassifier {
         val trainingData = features.map { (genre, vector) -> LabeledPoint(genreMap[genre]!!, vector) }
         trainingData.cache()
         val model = LogisticRegressionWithLBFGS().setNumClasses(genreMap.keys.size).run(trainingData.rdd())
-        
+
         var correct = 0
         for (film in test) {
             val prediction = predict(model, film.description)

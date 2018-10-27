@@ -6,36 +6,73 @@ import org.apache.spark.mllib.classification.LogisticRegressionModel
 import org.apache.spark.mllib.classification.LogisticRegressionWithLBFGS
 import org.apache.spark.mllib.feature.HashingTF
 import org.apache.spark.mllib.regression.LabeledPoint
+import org.slf4j.LoggerFactory
 
 class GenreClassifier {
 
     private val filmCreator = FilmCreator()
     private val inverseGenreMap = HashMap<Double, String>()
-    private val model = createModel()
+    private val conf = SparkConf().setAppName("genre-classifier").setMaster("local[*]")
+    private val sparkContext = JavaSparkContext(conf)
 
-    fun predict(text: String): String? {
+    private val logger = LoggerFactory.getLogger(javaClass)
+
+    private fun predict(model: LogisticRegressionModel, text: String): String? {
         val tf = HashingTF(10000)
         val vector = tf.transform(text.split(" "))
         val prediction = model.predict(vector)
         return inverseGenreMap[prediction]
     }
 
-    private fun createModel(): LogisticRegressionModel {
-        val conf = SparkConf().setAppName("genre-classifier").setMaster("local[*]")
-        val sparkContext = JavaSparkContext(conf)
-        val films = filmCreator.createFilms()
-        val tf = HashingTF(10000)
-        val pairs = films.map { film -> Pair(film.genre, film.description) }
-        val rdds = sparkContext.parallelize(pairs)
-        val genreMap = createGenreMap(pairs.map { it.first }.toSet())
-        val features = rdds.map { (genre, description) -> Pair(genre, tf.transform(description.split(" "))) }
-        val trainingData = features.map { foo -> LabeledPoint(genreMap[foo.first]!!, foo.second) }
-        trainingData.cache()
+    fun runKFold(amountOfChunks: Int, chunkToTest: Int): Double {
+        val films = filmCreator.createFilms().sortedByDescending { it.title.hashCode() }
+        val chunkSize = films.size / amountOfChunks
+        val chunks = createChunks(films, chunkSize)
+        val test = chunks[chunkToTest]
+        chunks.removeAt(chunkToTest)
+        val train = chunks.flatten()
 
-        return LogisticRegressionWithLBFGS().setNumClasses(genreMap.keys.size).run(trainingData.rdd())
+        val rdds = sparkContext.parallelize(films)
+        val genreMap = createGenreMap(train)
+        val tf = HashingTF(10000)
+
+        val features = rdds.map { film -> Pair(film.genre, tf.transform(film.description.split(" "))) }
+        val trainingData = features.map { (genre, vector) -> LabeledPoint(genreMap[genre]!!, vector) }
+        trainingData.cache()
+        val model = LogisticRegressionWithLBFGS().setNumClasses(genreMap.keys.size).run(trainingData.rdd())
+        
+        var correct = 0
+        for (film in test) {
+            val prediction = predict(model, film.description)
+            if (prediction == film.genre) {
+                correct += 1
+                println("Successfully predicted $prediction for '${film.title}'")
+            } else {
+                println("Failed to predict ${film.genre} for ${film.title}, instead predicted $prediction")
+            }
+        }
+        val total = test.size
+        val percentage = (correct / total.toDouble()) * 100
+        val str = "$percentage"
+        val dot = str.indexOf(".")
+        val finalStr = str.substring(0, dot + 3)
+        println("Of total $total, $finalStr were correctly predicted")
+
+        return percentage
     }
 
-    private fun createGenreMap(genres: Set<String>): HashMap<String, Double> {
+    private tailrec fun createChunks(films: List<FilmCreator.Film>, chunkSize: Int, result: MutableList<List<FilmCreator.Film>> = mutableListOf()): MutableList<List<FilmCreator.Film>> {
+        if(films.isEmpty()) {
+            return result
+        }
+        val chunk = films.take(chunkSize)
+        result.add(chunk)
+        val remaining = films - chunk
+        return createChunks(remaining, chunkSize, result)
+    }
+
+    private fun createGenreMap(films: List<FilmCreator.Film>): HashMap<String, Double> {
+        val genres = films.map { it.genre }.toSet()
         val genreMap = HashMap<String, Double>()
         var counter = 0.0
         for(genre in genres) {
